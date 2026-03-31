@@ -39,6 +39,9 @@ try {
         # Some scanners don't support all properties — continue with defaults
     }
 
+    # Delete leftover temp file if it exists
+    if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
+
     # Transfer image as BMP
     $formatBMP = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}"
     $image = $item.Transfer($formatBMP)

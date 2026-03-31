@@ -34,7 +34,10 @@ INTENT_MAP = {"color": 1, "grayscale": 2, "bw": 4}
 
 def load_settings() -> dict:
     if SETTINGS_FILE.exists():
-        return json.loads(SETTINGS_FILE.read_text())
+        try:
+            return json.loads(SETTINGS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
     return {}
 
 
@@ -72,7 +75,12 @@ def scan():
     color = data.get("color", "grayscale")
     intent = INTENT_MAP.get(color, 2)
 
-    tmp = os.path.join(tempfile.gettempdir(), f"hp_scan_{len(scanned_pages)}.bmp")
+    timestamp = datetime.now().strftime("%H%M%S%f")
+    tmp = os.path.join(tempfile.gettempdir(), f"hp_scan_{timestamp}.bmp")
+
+    # Clean up leftover temp files from previous scans
+    if os.path.exists(tmp):
+        os.remove(tmp)
 
     print(f"[SCAN] Starting scan at {dpi} DPI, intent={intent}...")
 
@@ -87,7 +95,7 @@ def scan():
             ],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
         )
 
         output = result.stdout.strip()
@@ -257,7 +265,7 @@ def set_save_dir_route():
                 "Add-Type -AssemblyName System.Windows.Forms; "
                 "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
                 "$d.Description = 'Choose folder for scanned files'; "
-                f"$d.SelectedPath = '{get_save_dir()}'; "
+                f"$d.SelectedPath = '{get_save_dir().replace(chr(39), chr(39)+chr(39))}'; "
                 "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath } "
                 "else { Write-Output 'CANCEL' }"
             ],
