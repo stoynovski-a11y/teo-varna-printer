@@ -2,15 +2,26 @@
 HP LaserJet M1132 MFP Scanner — Web App
 Runs on localhost:5555, opens in browser.
 Scanning done via PowerShell for reliable WIA device handling.
+
+Self-healing strategy (defense in depth):
+  1. Restart WIA service on startup (clears stale handles from previous run)
+  2. Serialize /scan calls with a lock (prevents concurrent COM races)
+  3. On scan failure: auto-restart WIA + retry once before reporting error
+  4. Manual /reset endpoint + UI button as last-resort recovery
+  5. Append every scan attempt to scan_log.txt for diagnostics
+  6. PowerShell scan.ps1 explicitly releases all COM objects in finally
 """
 
 import base64
+import ctypes
 import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -20,17 +31,88 @@ from PIL import Image
 app = Flask(__name__)
 
 # ── State ───────────────────────────────────────────────────────────
-scanned_pages: list[bytes] = []  # PNG bytes for each page
+scanned_pages: list[bytes] = []
+scan_lock = threading.Lock()              # prevents concurrent /scan calls
+scan_counter = 0                          # diagnostic counter for the log
 SCRIPT_DIR = Path(__file__).parent
 SCAN_PS1 = SCRIPT_DIR / "scan.ps1"
 SETTINGS_FILE = SCRIPT_DIR / "settings.json"
+LOG_FILE = SCRIPT_DIR / "scan_log.txt"
 
-# Default save directory
 DEFAULT_SAVE_DIR = os.path.join(os.path.expanduser("~"), "Documents", "Scans")
-
-# WIA intent constants
 INTENT_MAP = {"color": 1, "grayscale": 2, "bw": 4}
 
+# Proactive self-healing: the HP M1132 WIA driver is known to lock after ~10-15
+# scans. Restart the WIA service before every Nth scan to stay under that limit.
+SCANS_BEFORE_PROACTIVE_RESET = 10
+
+# Error fragments that mean "scanner is locked/busy" — worth restarting WIA + retrying.
+RECOVERABLE_ERRORS = (
+    "busy",
+    "0x80210006",      # WIA_ERROR_BUSY
+    "0x80210007",      # WIA_ERROR_OFFLINE
+    "0x8021000c",      # WIA_ERROR_DEVICE_LOCKED
+    "device is in use",
+    "no scanner found",
+    "scanner is in use",
+    "transfer cancelled",
+)
+
+# CREATE_NO_WINDOW so background PowerShell doesn't flash a console.
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+
+# ── Logging ─────────────────────────────────────────────────────────
+
+def log(msg: str):
+    """Append a timestamped line to scan_log.txt and print to stdout."""
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {msg}"
+    print(f"[LOG] {line}")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ── Admin / WIA control ─────────────────────────────────────────────
+
+def is_admin() -> bool:
+    """Check if the Flask process has admin rights (needed for service restart)."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def restart_wia(reason: str = "manual") -> tuple[bool, str]:
+    """Restart Windows Image Acquisition service. Needs admin. Returns (ok, message)."""
+    if not is_admin():
+        msg = "WIA restart skipped — app is not running as admin"
+        log(f"wia_restart | {reason} | SKIPPED (no admin)")
+        return False, msg
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Restart-Service stisvc -Force"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=NO_WINDOW,
+        )
+        if result.returncode == 0:
+            log(f"wia_restart | {reason} | OK")
+            time.sleep(1.5)  # give WIA a moment to come back up
+            return True, "WIA service restarted"
+        err = (result.stderr or result.stdout).strip() or "unknown error"
+        log(f"wia_restart | {reason} | FAILED: {err}")
+        return False, err
+    except Exception as e:
+        log(f"wia_restart | {reason} | EXCEPTION: {e}")
+        return False, str(e)
+
+
+# ── Settings ────────────────────────────────────────────────────────
 
 def load_settings() -> dict:
     if SETTINGS_FILE.exists():
@@ -61,6 +143,45 @@ def make_thumbnail(png_bytes: bytes) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+# ── Core scan operation (runs PowerShell once) ──────────────────────
+
+def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
+    """Run scan.ps1 once. Returns (ok, output_path, error_msg)."""
+    timestamp = datetime.now().strftime("%H%M%S%f")
+    tmp = os.path.join(tempfile.gettempdir(), f"hp_scan_{timestamp}.bmp")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(SCAN_PS1),
+                "-DPI", str(dpi),
+                "-ColorIntent", str(intent),
+                "-OutputPath", tmp,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,                    # was 180; shorter so we retry sooner
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        return False, None, "timeout"
+
+    output = (result.stdout or "").strip()
+    if output.startswith("ERROR:"):
+        return False, None, output[6:].strip()
+    if output != "OK" or not os.path.exists(tmp):
+        return False, None, f"unexpected output: {output[:200]}"
+    return True, tmp, None
+
+
+def _is_recoverable(err: str) -> bool:
+    el = (err or "").lower()
+    return any(token in el for token in RECOVERABLE_ERRORS)
+
+
 # ── Routes ──────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -70,85 +191,105 @@ def index():
 
 @app.route("/scan", methods=["POST"])
 def scan():
-    data = request.json or {}
-    dpi = int(data.get("dpi", 200))
-    color = data.get("color", "grayscale")
-    intent = INTENT_MAP.get(color, 2)
+    global scan_counter
 
-    timestamp = datetime.now().strftime("%H%M%S%f")
-    tmp = os.path.join(tempfile.gettempdir(), f"hp_scan_{timestamp}.bmp")
-
-    # Clean up leftover temp files from previous scans
-    if os.path.exists(tmp):
-        os.remove(tmp)
-
-    print(f"[SCAN] Starting scan at {dpi} DPI, intent={intent}...")
+    # Single scan at a time — prevents concurrent COM races.
+    if not scan_lock.acquire(blocking=False):
+        return jsonify(ok=False, error="A scan is already in progress. Wait for it to finish.")
 
     try:
-        result = subprocess.run(
-            [
-                "powershell", "-ExecutionPolicy", "Bypass",
-                "-File", str(SCAN_PS1),
-                "-DPI", str(dpi),
-                "-ColorIntent", str(intent),
-                "-OutputPath", tmp,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
+        data = request.json or {}
+        dpi = int(data.get("dpi", 200))
+        color = data.get("color", "grayscale")
+        intent = INTENT_MAP.get(color, 2)
 
-        output = result.stdout.strip()
-        print(f"[SCAN] PowerShell output: {output}")
+        # Proactive WIA restart every N scans — prevents the firmware lockup
+        # that historically broke the app every few days.
+        if scan_counter > 0 and scan_counter % SCANS_BEFORE_PROACTIVE_RESET == 0:
+            log(f"proactive_reset | {scan_counter} scans since last restart — refreshing WIA")
+            restart_wia(reason=f"proactive every {SCANS_BEFORE_PROACTIVE_RESET}")
 
-        if result.stderr:
-            print(f"[SCAN] PowerShell stderr: {result.stderr.strip()}")
+        scan_counter += 1
+        n = scan_counter
+        log(f"scan {n} | start | dpi={dpi} color={color}")
 
-        if output.startswith("ERROR:"):
-            error_msg = output[6:]
-            print(f"[SCAN] Scan failed: {error_msg}")
-            return jsonify(ok=False, error=error_msg)
+        t0 = time.time()
+        ok, tmp, err = _run_scan_once(dpi, intent)
+        dt = time.time() - t0
 
-        if output != "OK" or not os.path.exists(tmp):
-            return jsonify(ok=False, error=f"Unexpected result: {output}")
+        # Auto-recovery: on recoverable failure, restart WIA + retry once.
+        if not ok and _is_recoverable(err or ""):
+            log(f"scan {n} | FAILED ({dt:.1f}s): {err} — attempting auto-recovery")
+            restart_wia(reason=f"scan {n} failure")
 
-        file_size = os.path.getsize(tmp)
-        print(f"[SCAN] BMP saved: {file_size} bytes")
+            t0 = time.time()
+            ok, tmp, err = _run_scan_once(dpi, intent)
+            dt = time.time() - t0
+            if ok:
+                log(f"scan {n} | retry OK ({dt:.1f}s)")
+            else:
+                log(f"scan {n} | retry FAILED ({dt:.1f}s): {err}")
 
-        img = Image.open(tmp)
-        print(f"[SCAN] Image: {img.size}, mode={img.mode}")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
-        img.close()
-        os.remove(tmp)
+        if not ok:
+            user_err = err or "unknown error"
+            if "timeout" in user_err.lower():
+                user_err = "Scan timed out. Try the Reset Scanner button, or power cycle the printer."
+            return jsonify(ok=False, error=user_err)
+
+        # Convert BMP → PNG, append to session pages.
+        try:
+            img = Image.open(tmp)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            png_bytes = buf.getvalue()
+            img.close()
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
         scanned_pages.append(png_bytes)
-        n = len(scanned_pages)
-        print(f"[SCAN] Page {n} saved ({len(png_bytes)} bytes PNG)")
-
-        thumb_b64 = make_thumbnail(png_bytes)
-        print(f"[SCAN] Done!")
+        page_num = len(scanned_pages)
+        log(f"scan {n} | OK ({dt:.1f}s) | page {page_num} | {len(png_bytes)} bytes")
 
         return jsonify(
             ok=True,
-            page=n,
-            thumbnail=f"data:image/png;base64,{thumb_b64}",
+            page=page_num,
+            thumbnail=f"data:image/png;base64,{make_thumbnail(png_bytes)}",
         )
 
-    except subprocess.TimeoutExpired:
-        print("[SCAN] ERROR: Scan timed out after 120 seconds")
-        return jsonify(ok=False, error="Scan timed out. Try turning the printer off and on.")
-    except Exception as e:
-        print(f"[SCAN] ERROR: {e}")
-        return jsonify(ok=False, error=str(e))
+    finally:
+        scan_lock.release()
+
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    """Manual recovery: restart the WIA service. Only one at a time."""
+    if not scan_lock.acquire(blocking=False):
+        return jsonify(ok=False, error="A scan is in progress. Wait for it to finish.")
+    try:
+        ok, msg = restart_wia(reason="manual /reset")
+        if ok:
+            return jsonify(ok=True, message=msg)
+        # If admin missing, surface that clearly so colleague knows what to do.
+        if "not running as admin" in msg.lower():
+            return jsonify(
+                ok=False,
+                error=(
+                    "Cannot restart scanner — the app is not running as administrator.\n\n"
+                    "Close this window, right-click 'СТАРТИРАЙ СКЕНЕР.bat', "
+                    "and choose 'Run as administrator'."
+                ),
+            )
+        return jsonify(ok=False, error=msg)
+    finally:
+        scan_lock.release()
 
 
 @app.route("/pages", methods=["GET"])
 def get_pages():
-    thumbnails = []
-    for png_bytes in scanned_pages:
-        thumbnails.append(f"data:image/png;base64,{make_thumbnail(png_bytes)}")
+    thumbnails = [f"data:image/png;base64,{make_thumbnail(b)}" for b in scanned_pages]
     return jsonify(ok=True, pages=thumbnails)
 
 
@@ -185,16 +326,10 @@ def save_pdf():
     filepath = os.path.join(save_dir, filename)
 
     try:
-        images = []
-        for png_bytes in scanned_pages:
-            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-            images.append(img)
-
+        images = [Image.open(io.BytesIO(b)).convert("RGB") for b in scanned_pages]
         images[0].save(filepath, "PDF", save_all=True, append_images=images[1:])
-
         scanned_pages.clear()
         return jsonify(ok=True, path=filepath, filename=filename)
-
     except Exception as e:
         return jsonify(ok=False, error=str(e))
 
@@ -211,16 +346,10 @@ def quick_save():
     filepath = os.path.join(save_dir, filename)
 
     try:
-        images = []
-        for png_bytes in scanned_pages:
-            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-            images.append(img)
-
+        images = [Image.open(io.BytesIO(b)).convert("RGB") for b in scanned_pages]
         images[0].save(filepath, "PDF", save_all=True, append_images=images[1:])
-
         scanned_pages.clear()
         return jsonify(ok=True, path=filepath, filename=filename)
-
     except Exception as e:
         return jsonify(ok=False, error=str(e))
 
@@ -234,7 +363,6 @@ def save_images():
     save_dir = get_save_dir()
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     saved = []
-
     try:
         for i, png_bytes in enumerate(scanned_pages):
             fname = f"scan_{timestamp}_p{i+1}.png"
@@ -242,10 +370,8 @@ def save_images():
             with open(fpath, "wb") as f:
                 f.write(png_bytes)
             saved.append(fname)
-
         scanned_pages.clear()
         return jsonify(ok=True, files=saved, folder=save_dir)
-
     except Exception as e:
         return jsonify(ok=False, error=str(e))
 
@@ -261,7 +387,7 @@ def set_save_dir_route():
     try:
         result = subprocess.run(
             [
-                "powershell", "-ExecutionPolicy", "Bypass", "-Command",
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
                 "Add-Type -AssemblyName System.Windows.Forms; "
                 "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
                 "$d.Description = 'Choose folder for scanned files'; "
@@ -272,6 +398,7 @@ def set_save_dir_route():
             capture_output=True,
             text=True,
             timeout=60,
+            creationflags=NO_WINDOW,
         )
         folder = result.stdout.strip()
         if folder and folder != "CANCEL":
@@ -308,7 +435,18 @@ def open_file():
 
 if __name__ == "__main__":
     import webbrowser
-    import threading
+
+    log("=" * 50)
+    log(f"app start | admin={is_admin()}")
+
+    # Fresh WIA state every launch — clears stale handles from prior session.
+    if is_admin():
+        restart_wia(reason="startup")
+    else:
+        log("startup | not admin — auto-recovery DISABLED. Re-run as admin for self-healing.")
+        print("\n  ⚠️  Not running as administrator.")
+        print("  Auto-recovery is disabled. Reset Scanner button will not work.")
+        print("  Right-click 'СТАРТИРАЙ СКЕНЕР.bat' and choose 'Run as administrator'.\n")
 
     port = 5555
     url = f"http://localhost:{port}"

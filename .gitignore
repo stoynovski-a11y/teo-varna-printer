@@ -1,3 +1,6 @@
 settings.json
+scan_log.txt
+.DS_Store
 __pycache__/
 *.pyc
+*(Unicode Encoding Conflict)*

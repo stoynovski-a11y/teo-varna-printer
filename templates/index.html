@@ -472,6 +472,13 @@
                     </svg>
                     Open Folder
                 </button>
+                <button class="quick-link" id="resetBtn" onclick="resetScanner()" title="Restart the scanner service if it gets stuck">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                        <path d="M23 4v6h-6M1 20v-6h6"/>
+                        <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+                    </svg>
+                    Reset Scanner
+                </button>
             </div>
 
             <div class="kbd-hint">
@@ -761,6 +768,32 @@
     // ── Open folder ──
     async function openFolder() {
         await fetch('/open-folder', {method: 'POST'});
+    }
+
+    // ── Reset Scanner (restarts the WIA Windows service) ──
+    async function resetScanner() {
+        if (scanning) return;
+        if (!confirm('Restart the scanner service?\n\nUse this if the scanner is stuck or not responding.')) return;
+
+        const btn = document.getElementById('resetBtn');
+        const original = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<span>Resetting…</span>';
+
+        try {
+            const res = await fetch('/reset', {method: 'POST'});
+            const data = await res.json();
+            if (data.ok) {
+                showToast(data.message || 'Scanner reset OK — try scanning now.', 'success');
+            } else {
+                showToast(data.error || 'Reset failed', 'error');
+            }
+        } catch (e) {
+            showToast('Connection error: ' + e.message, 'error');
+        }
+
+        btn.disabled = false;
+        btn.innerHTML = original;
     }
 
     // ── Helpers ──

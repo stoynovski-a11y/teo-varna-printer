@@ -5,12 +5,17 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$scanner = $null
+
+# Initialize ALL COM handles at top so finally can release every one,
+# even if the script fails partway through.
 $deviceManager = $null
+$scanner       = $null
+$items         = $null
+$item          = $null
+$image         = $null
 
 try {
     $deviceManager = New-Object -ComObject WIA.DeviceManager
-    $scanner = $null
 
     foreach ($info in $deviceManager.DeviceInfos) {
         if ($info.Type -eq 1) {
@@ -24,22 +29,23 @@ try {
         exit 1
     }
 
-    $item = $scanner.Items.Item(1)
+    # Capture the Items collection so we can release it (was leaking before).
+    $items = $scanner.Items
+    $item  = $items.Item(1)
 
     # Set scan properties (DPI and color mode)
     try {
         foreach ($prop in $item.Properties) {
             switch ($prop.PropertyID) {
-                6147 { $prop.Value = $DPI }   # Horizontal Resolution
-                6148 { $prop.Value = $DPI }   # Vertical Resolution
-                6146 { $prop.Value = $ColorIntent }  # Current Intent
+                6147 { $prop.Value = $DPI }          # X resolution
+                6148 { $prop.Value = $DPI }          # Y resolution
+                6146 { $prop.Value = $ColorIntent }  # Current intent
             }
         }
     } catch {
-        # Some scanners don't support all properties — continue with defaults
+        # Some scanners don't expose these — fall back to defaults
     }
 
-    # Delete leftover temp file if it exists
     if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
 
     # Transfer image as BMP
@@ -53,16 +59,17 @@ try {
     Write-Output "ERROR:$($_.Exception.Message)"
     exit 1
 } finally {
-    # Properly release COM objects so the scanner doesn't stay locked
-    if ($item) {
-        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($item) | Out-Null } catch {}
-    }
-    if ($scanner) {
-        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($scanner) | Out-Null } catch {}
-    }
-    if ($deviceManager) {
-        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($deviceManager) | Out-Null } catch {}
-    }
+    # Release in reverse order of acquisition.
+    # $image holds an open handle to the WIA device — release FIRST so the
+    # device session closes before we drop the parent objects.
+    if ($image)         { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($image)         | Out-Null } catch {} }
+    if ($item)          { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($item)          | Out-Null } catch {} }
+    if ($items)         { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($items)         | Out-Null } catch {} }
+    if ($scanner)       { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($scanner)       | Out-Null } catch {} }
+    if ($deviceManager) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($deviceManager) | Out-Null } catch {} }
+
+    # Two GC passes — second one catches refs freed by the first.
     [System.GC]::Collect()
     [System.GC]::WaitForPendingFinalizers()
+    [System.GC]::Collect()
 }
