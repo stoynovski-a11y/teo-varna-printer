@@ -22,17 +22,11 @@ echo.
 cd /d "%~dp0"
 
 REM ---- Install NAPS2 on first launch (TWAIN backend bypasses M1132 WIA bug) ----
+REM Logic lives in install_naps2.ps1 (avoids cmd-to-powershell quote escape hell).
+REM Idempotent: the .ps1 exits immediately if NAPS2 is already installed.
 if not exist "C:\Program Files\NAPS2\NAPS2.Console.exe" (
     if not exist "C:\Program Files (x86)\NAPS2\NAPS2.Console.exe" (
-        echo [..] First launch: installing NAPS2 scanner backend ^(one-time, ~30s^)...
-        powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { $r = Invoke-RestMethod 'https://api.github.com/repos/cyanfish/naps2/releases/latest'; $a = $r.assets | Where-Object { $_.name -like '*setup.exe' -and $_.name -notlike '*portable*' } | Select-Object -First 1; Invoke-WebRequest $a.browser_download_url -OutFile \"$env:TEMP\naps2-setup.exe\" } catch { exit 1 }"
-        if exist "%TEMP%\naps2-setup.exe" (
-            start /wait "" "%TEMP%\naps2-setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-            del "%TEMP%\naps2-setup.exe" 2>nul
-            echo [OK] NAPS2 installed.
-        ) else (
-            echo [!] NAPS2 download failed - will fall back to WIA scanning.
-        )
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_naps2.ps1"
     )
 )
 
@@ -57,7 +51,7 @@ if %errorlevel% equ 0 (
     if exist "%EXTRACT_DIR%" rmdir /s /q "%EXTRACT_DIR%"
     powershell -NoProfile -Command "Expand-Archive -Path '%ZIP_FILE%' -DestinationPath '%EXTRACT_DIR%' -Force" 2>nul
     if exist "%EXTRACT_DIR%\teo-varna-printer-main\app.py" (
-        robocopy "%EXTRACT_DIR%\teo-varna-printer-main" "%~dp0" app.py scan.ps1 requirements.txt /NFL /NDL /NJH /NJS /NC /NS >nul
+        robocopy "%EXTRACT_DIR%\teo-varna-printer-main" "%~dp0" app.py scan.ps1 requirements.txt install_naps2.ps1 /NFL /NDL /NJH /NJS /NC /NS >nul
         robocopy "%EXTRACT_DIR%\teo-varna-printer-main\templates" "%~dp0templates" /E /NFL /NDL /NJH /NJS /NC /NS >nul
         echo [OK] Updated to latest version.
     )
