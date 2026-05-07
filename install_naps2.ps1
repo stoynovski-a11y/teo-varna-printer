@@ -23,7 +23,7 @@ foreach ($p in $candidates) {
 
 # Hardcoded direct URL — avoids the GitHub API entirely. Pin to a known
 # good release; bump the version manually when newer is needed.
-$url = 'https://github.com/cyanfish/naps2/releases/download/v8.2.1/naps2-8.2.1-win-x64-portable.zip'
+$url = 'https://github.com/cyanfish/naps2/releases/download/v8.2.1/naps2-8.2.1-win-x64.zip'
 $zip = Join-Path $env:TEMP 'naps2-portable.zip'
 
 try {
