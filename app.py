@@ -85,27 +85,66 @@ def is_admin() -> bool:
         return False
 
 
+def _sc(args: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["sc"] + args,
+        capture_output=True, text=True, timeout=timeout, creationflags=NO_WINDOW,
+    )
+
+
 def restart_wia(reason: str = "manual") -> tuple[bool, str]:
-    """Restart Windows Image Acquisition service. Needs admin. Returns (ok, message)."""
+    """Restart WIA. If the service refuses to stop (process holding handle),
+    kill the svchost hosting it and start it back up."""
     if not is_admin():
         msg = "WIA restart skipped — app is not running as admin"
         log(f"wia_restart | {reason} | SKIPPED (no admin)")
         return False, msg
 
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", "Restart-Service stisvc -Force"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            creationflags=NO_WINDOW,
-        )
-        if result.returncode == 0:
+        # 1. Ask the service to stop. Don't fail if this errors — we'll check state next.
+        _sc(["stop", "stisvc"])
+
+        # 2. Poll up to 10s for the service to actually transition to STOPPED.
+        stopped = False
+        for _ in range(10):
+            time.sleep(1)
+            q = _sc(["query", "stisvc"])
+            if "STOPPED" in q.stdout.upper():
+                stopped = True
+                break
+
+        # 3. If still not stopped, find the host svchost PID and kill it.
+        #    sc queryex outputs a "PID : <n>" line.
+        if not stopped:
+            qx = _sc(["queryex", "stisvc"])
+            pid = None
+            for line in qx.stdout.splitlines():
+                s = line.strip()
+                if s.upper().startswith("PID"):
+                    _, _, val = s.partition(":")
+                    val = val.strip()
+                    if val.isdigit() and val != "0":
+                        pid = val
+                    break
+            if pid:
+                log(f"wia_restart | {reason} | stop hung — killing host PID {pid}")
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", pid],
+                    capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW,
+                )
+                time.sleep(2)
+            else:
+                log(f"wia_restart | {reason} | stop hung and no host PID found")
+
+        # 4. Start the service. Error 1056 = already running, treat as success.
+        start = _sc(["start", "stisvc"])
+        out = (start.stdout + start.stderr).upper()
+        if start.returncode == 0 or "1056" in out:
             log(f"wia_restart | {reason} | OK")
-            time.sleep(1.5)  # give WIA a moment to come back up
+            time.sleep(1.5)
             return True, "WIA service restarted"
-        err = (result.stderr or result.stdout).strip() or "unknown error"
-        log(f"wia_restart | {reason} | FAILED: {err}")
+        err = (start.stderr or start.stdout).strip() or "unknown error"
+        log(f"wia_restart | {reason} | FAILED start: {err}")
         return False, err
     except Exception as e:
         log(f"wia_restart | {reason} | EXCEPTION: {e}")
@@ -440,8 +479,9 @@ if __name__ == "__main__":
     log(f"app start | admin={is_admin()}")
 
     # Fresh WIA state every launch — clears stale handles from prior session.
+    # Run in a background thread so a hung Stop doesn't delay the Flask server.
     if is_admin():
-        restart_wia(reason="startup")
+        threading.Thread(target=restart_wia, args=("startup",), daemon=True).start()
     else:
         log("startup | not admin — auto-recovery DISABLED. Re-run as admin for self-healing.")
         print("\n  ⚠️  Not running as administrator.")
