@@ -53,23 +53,26 @@ try {
     $image = $item.Transfer($formatBMP)
     $image.SaveFile($OutputPath)
 
+    # Print + flush IMMEDIATELY — Python detects success from this and may kill
+    # us before cleanup runs. The BMP is already on disk; the OS will reclaim
+    # any leaked COM handles when our process dies.
     Write-Output "OK"
+    [Console]::Out.Flush()
 
 } catch {
     Write-Output "ERROR:$($_.Exception.Message)"
+    [Console]::Out.Flush()
     exit 1
 } finally {
-    # Release in reverse order of acquisition.
-    # $image holds an open handle to the WIA device — release FIRST so the
-    # device session closes before we drop the parent objects.
-    if ($image)         { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($image)         | Out-Null } catch {} }
+    # Best-effort cleanup. M1132 firmware lockup makes ReleaseComObject($image)
+    # hang in WIA driver code — skip it. Parent (Python) detects success via
+    # the BMP file and kills us; OS cleanup reclaims everything on process death.
     if ($item)          { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($item)          | Out-Null } catch {} }
     if ($items)         { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($items)         | Out-Null } catch {} }
     if ($scanner)       { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($scanner)       | Out-Null } catch {} }
     if ($deviceManager) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($deviceManager) | Out-Null } catch {} }
 
-    # Two GC passes — second one catches refs freed by the first.
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
+    # No GC.WaitForPendingFinalizers — that can also hang if a finalizer for
+    # a leaked WIA object is stuck.
     [System.GC]::Collect()
 }

@@ -256,9 +256,11 @@ def _kill_tree(pid: int) -> None:
 def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
     """Run scan.ps1 once. Returns (ok, output_path, error_msg).
 
-    Implementation note: stdout goes to a file instead of subprocess.PIPE,
-    because PIPE-based communicate() deadlocks if PowerShell's COM call
-    hangs (child processes keep pipe handles open even after kill())."""
+    Strategy: detect success by watching the BMP file appear on disk, NOT
+    by waiting for PowerShell to exit. The HP M1132 firmware bug causes
+    PowerShell to hang in COM cleanup AFTER the BMP is already saved — so
+    process exit can take forever even when the scan itself succeeded.
+    """
     global _running_scan_proc
     timestamp = datetime.now().strftime("%H%M%S%f")
     tmp = os.path.join(tempfile.gettempdir(), f"hp_scan_{timestamp}.bmp")
@@ -282,18 +284,38 @@ def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]
             creationflags=NO_WINDOW,
         )
         _running_scan_proc = proc
+
+        timeout_s = 90
+        deadline = time.time() + timeout_s
+        outcome = None  # "bmp_ready" | "ps_exited" | "timeout"
+        last_progress_log = time.time()
+
         try:
-            try:
-                proc.wait(timeout=90)
-                log(f"scan exec | powershell exited rc={proc.returncode}")
-            except subprocess.TimeoutExpired:
-                log(f"scan exec | TIMEOUT after 90s — killing PID {proc.pid} + tree")
-                _kill_tree(proc.pid)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                return False, None, "timeout"
+            while time.time() < deadline:
+                # PowerShell exited (either error or success-with-fast-cleanup)
+                if proc.poll() is not None:
+                    outcome = "ps_exited"
+                    break
+
+                # BMP file appeared — wait for size to stabilize (~700ms)
+                if os.path.exists(tmp):
+                    size1 = os.path.getsize(tmp)
+                    time.sleep(0.7)
+                    if (os.path.exists(tmp)
+                            and os.path.getsize(tmp) == size1
+                            and size1 > 0):
+                        outcome = "bmp_ready"
+                        break
+
+                # Periodic progress log so a hang is visible in real time
+                if time.time() - last_progress_log >= 15:
+                    elapsed = int(time.time() - (deadline - timeout_s))
+                    log(f"scan exec | still waiting... {elapsed}s elapsed")
+                    last_progress_log = time.time()
+
+                time.sleep(0.3)
+            else:
+                outcome = "timeout"
         finally:
             _running_scan_proc = None
     finally:
@@ -302,27 +324,48 @@ def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]
         except Exception:
             pass
 
-    try:
-        with open(out_file, "r", encoding="utf-8", errors="replace") as f:
-            stdout = f.read()
-    except OSError:
-        stdout = ""
-    finally:
+    if outcome == "bmp_ready":
+        size = os.path.getsize(tmp)
+        log(f"scan exec | BMP ready ({size} bytes) — killing PS to skip hung cleanup")
+        _kill_tree(proc.pid)
+        return True, tmp, None
+
+    if outcome == "ps_exited":
+        log(f"scan exec | powershell exited rc={proc.returncode}")
+        # Final BMP check — PS may have exited with success leaving file behind
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            return True, tmp, None
+        # Otherwise read stdout for ERROR:... message
         try:
-            os.remove(out_file)
+            with open(out_file, "r", encoding="utf-8", errors="replace") as f:
+                stdout = f.read()
         except OSError:
-            pass
-
-    output = (stdout or "").strip()
-    log(f"scan exec | output: {output[:120]!r}")
-
-    if output.startswith("ERROR:"):
-        return False, None, output[6:].strip()
-    if not output:
-        return False, None, "killed by reset"
-    if output != "OK" or not os.path.exists(tmp):
+            stdout = ""
+        finally:
+            try:
+                os.remove(out_file)
+            except OSError:
+                pass
+        output = (stdout or "").strip()
+        log(f"scan exec | output: {output[:120]!r}")
+        if output.startswith("ERROR:"):
+            return False, None, output[6:].strip()
+        if not output:
+            return False, None, "killed by reset"
         return False, None, f"unexpected output: {output[:200]}"
-    return True, tmp, None
+
+    # outcome == "timeout"
+    log(f"scan exec | TIMEOUT after {timeout_s}s — killing PID {proc.pid} + tree")
+    _kill_tree(proc.pid)
+    # Edge case: BMP arrived in the last poll interval — salvage it
+    if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+        log(f"scan exec | timeout but BMP exists ({os.path.getsize(tmp)} bytes) — using it")
+        return True, tmp, None
+    try:
+        os.remove(out_file)
+    except OSError:
+        pass
+    return False, None, "timeout"
 
 
 def _is_recoverable(err: str) -> bool:
