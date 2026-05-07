@@ -21,6 +21,16 @@ echo.
 
 cd /d "%~dp0"
 
+REM ---- Disable USB Selective Suspend on the active power plan ----
+REM Sleeping the USB endpoint is the #1 trigger of the M1132 firmware
+REM lockup. Idempotent — safe to run every launch.
+REM   2a737441-... = "USB settings" subgroup
+REM   48e6b7a6-... = "USB selective suspend setting"
+REM   value 0      = Disabled
+powercfg -setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 >nul 2>&1
+powercfg -setdcvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 >nul 2>&1
+powercfg -setactive SCHEME_CURRENT >nul 2>&1
+
 REM ---- Auto-update from GitHub (skip silently if offline) ----
 echo [..] Checking for updates...
 set "ZIP_URL=https://github.com/stoynovski-a11y/teo-varna-printer/archive/refs/heads/main.zip"

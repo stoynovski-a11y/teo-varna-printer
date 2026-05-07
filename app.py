@@ -151,6 +151,57 @@ def restart_wia(reason: str = "manual") -> tuple[bool, str]:
         return False, str(e)
 
 
+# ── Cyber unplug/replug: escalation when WIA restart isn't enough ──
+# The HP M1132 has a known firmware bug where the scanner endpoint
+# stops responding after sleep or heavy use. WIA service restart
+# alone doesn't always recover it — but a USB re-enumeration via
+# Disable-PnpDevice/Enable-PnpDevice does. Equivalent to physically
+# unplugging and replugging the USB cable.
+
+def _find_scanner_instance_id() -> str | None:
+    """Return the PnP InstanceId of the first WIA scanner, or None."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-PnpDevice -Class Image -PresentOnly | "
+             "Select-Object -First 1 -ExpandProperty InstanceId"],
+            capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW,
+        )
+        return (result.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def reset_scanner_device(reason: str = "manual") -> bool:
+    """Disable then re-enable the scanner PnP device.
+    Functionally identical to USB reseat; resets the printer's USB endpoint."""
+    if not is_admin():
+        log(f"device_reset | {reason} | SKIPPED (no admin)")
+        return False
+
+    instance_id = _find_scanner_instance_id()
+    if not instance_id:
+        log(f"device_reset | {reason} | SKIPPED (no scanner found)")
+        return False
+
+    log(f"device_reset | {reason} | resetting {instance_id}")
+    try:
+        ps_safe = instance_id.replace("'", "''")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Disable-PnpDevice -InstanceId '{ps_safe}' -Confirm:$false; "
+             f"Start-Sleep 3; "
+             f"Enable-PnpDevice -InstanceId '{ps_safe}' -Confirm:$false"],
+            capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW,
+        )
+        time.sleep(3)  # let device come back up
+        log(f"device_reset | {reason} | OK")
+        return True
+    except Exception as e:
+        log(f"device_reset | {reason} | EXCEPTION: {e}")
+        return False
+
+
 # ── Settings ────────────────────────────────────────────────────────
 
 def load_settings() -> dict:
@@ -273,18 +324,29 @@ def scan():
         ok, tmp, err = _run_scan_once(dpi, intent)
         dt = time.time() - t0
 
-        # Auto-recovery: on recoverable failure, restart WIA + retry once.
+        # Auto-recovery ladder for the M1132 firmware lockup:
+        #   tier 1: WIA service restart + retry
+        #   tier 2: device re-enumeration (Disable/Enable PnP) + retry
         if not ok and _is_recoverable(err or ""):
-            log(f"scan {n} | FAILED ({dt:.1f}s): {err} — attempting auto-recovery")
+            log(f"scan {n} | FAILED ({dt:.1f}s): {err} — tier 1 recovery (WIA)")
             restart_wia(reason=f"scan {n} failure")
 
             t0 = time.time()
             ok, tmp, err = _run_scan_once(dpi, intent)
             dt = time.time() - t0
+
+            if not ok and _is_recoverable(err or ""):
+                log(f"scan {n} | tier 1 retry FAILED ({dt:.1f}s): {err} — tier 2 (device reset)")
+                reset_scanner_device(reason=f"scan {n} second failure")
+
+                t0 = time.time()
+                ok, tmp, err = _run_scan_once(dpi, intent)
+                dt = time.time() - t0
+
             if ok:
-                log(f"scan {n} | retry OK ({dt:.1f}s)")
+                log(f"scan {n} | recovery OK ({dt:.1f}s)")
             else:
-                log(f"scan {n} | retry FAILED ({dt:.1f}s): {err}")
+                log(f"scan {n} | all recovery failed ({dt:.1f}s): {err}")
 
         if not ok:
             user_err = err or "unknown error"
@@ -340,8 +402,13 @@ def reset():
 
     # 2. Restart WIA — does NOT need scan_lock; it's an OS-level operation.
     ok, msg = restart_wia(reason="manual /reset")
+
+    # 3. Always also do a device re-enumeration. Users press Reset because
+    #    something is genuinely broken — the extra ~5s is worth the higher
+    #    success rate for M1132 firmware lockups.
     if ok:
-        return jsonify(ok=True, message=msg)
+        reset_scanner_device(reason="manual /reset")
+        return jsonify(ok=True, message="Scanner reset (WIA service + USB device).")
     if "not running as admin" in msg.lower():
         return jsonify(
             ok=False,
