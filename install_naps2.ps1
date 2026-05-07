@@ -1,52 +1,68 @@
-# Silent NAPS2 install. Idempotent — exits 0 immediately if already installed.
-# Called by СТАРТИРАЙ СКЕНЕР.bat on first launch. Runs as admin (caller is admin).
+# Provision NAPS2 (portable variant — no installer, no admin install).
+# Idempotent: exits 0 immediately if NAPS2 is already available.
+# Called by СТАРТИРАЙ СКЕНЕР.bat on first launch.
 $ErrorActionPreference = 'Stop'
 
-$paths = @(
+$portableDir = Join-Path $env:LOCALAPPDATA 'HPScanner\naps2-portable'
+
+# Where we'd find NAPS2.Console.exe in any provisioning mode
+$candidates = @(
     'C:\Program Files\NAPS2\NAPS2.Console.exe',
-    'C:\Program Files (x86)\NAPS2\NAPS2.Console.exe'
+    'C:\Program Files (x86)\NAPS2\NAPS2.Console.exe',
+    (Join-Path $portableDir 'NAPS2.Console.exe'),
+    (Join-Path $portableDir 'App\NAPS2.Console.exe')
 )
-foreach ($p in $paths) {
+foreach ($p in $candidates) {
     if (Test-Path $p) {
-        Write-Host "[OK] NAPS2 already installed at $p"
+        Write-Host "[OK] NAPS2 already available at $p"
         exit 0
     }
 }
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Hardcoded direct URL — avoids the GitHub API entirely. Pin to a known
+# good release; bump the version manually when newer is needed.
+$url = 'https://github.com/cyanfish/naps2/releases/download/v8.2.1/naps2-8.2.1-win-x64-portable.zip'
+$zip = Join-Path $env:TEMP 'naps2-portable.zip'
+
 try {
-    Write-Host '[..] Querying GitHub for latest NAPS2 release...'
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/cyanfish/naps2/releases/latest'
+    Write-Host '[..] Downloading NAPS2 portable from GitHub...'
+    Invoke-WebRequest $url -OutFile $zip -UseBasicParsing -TimeoutSec 90
+    $size = (Get-Item $zip).Length
+    Write-Host "[OK] Downloaded $([math]::Round($size / 1MB, 1)) MB"
+} catch {
+    Write-Host "[!] Download failed: $_"
+    Write-Host "    Falling back to WIA scan path."
+    exit 1
+}
 
-    # NAPS2 ships e.g. naps2-8.2.1-win-x64.exe (Inno Setup installer)
-    $asset = $rel.assets | Where-Object { $_.name -like 'naps2-*-win-x64.exe' } | Select-Object -First 1
-    if (-not $asset) {
-        throw "No win-x64.exe asset found in latest release"
-    }
+try {
+    if (Test-Path $portableDir) { Remove-Item $portableDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $portableDir -Force | Out-Null
 
-    $setup = Join-Path $env:TEMP 'naps2-setup.exe'
-    Write-Host "[..] Downloading $($asset.name) ($([math]::Round($asset.size / 1MB, 1)) MB)..."
-    Invoke-WebRequest $asset.browser_download_url -OutFile $setup -UseBasicParsing
+    Write-Host '[..] Extracting...'
+    Expand-Archive -Path $zip -DestinationPath $portableDir -Force
+    Remove-Item $zip -ErrorAction SilentlyContinue
 
-    Write-Host '[..] Installing silently (Inno Setup VERYSILENT)...'
-    $proc = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        throw "setup.exe exited with code $($proc.ExitCode)"
-    }
-
-    Remove-Item $setup -ErrorAction SilentlyContinue
-
-    foreach ($p in $paths) {
+    foreach ($p in $candidates) {
         if (Test-Path $p) {
-            Write-Host "[OK] NAPS2 installed at $p"
+            Write-Host "[OK] NAPS2 ready at $p"
             exit 0
         }
     }
-    throw "Install reported success but NAPS2.Console.exe not found in expected locations"
+
+    # Some portable builds nest everything under a top-level folder. Search.
+    $exe = Get-ChildItem -Path $portableDir -Filter 'NAPS2.Console.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($exe) {
+        Write-Host "[OK] NAPS2 ready at $($exe.FullName)"
+        exit 0
+    }
+
+    Write-Host "[!] Extracted but NAPS2.Console.exe not found in $portableDir"
+    exit 1
 
 } catch {
-    Write-Host "[!] NAPS2 install failed: $_"
-    Write-Host "    The app will fall back to the WIA scan path."
+    Write-Host "[!] Extract failed: $_"
     exit 1
 }

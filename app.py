@@ -235,16 +235,26 @@ def make_thumbnail(png_bytes: bytes) -> str:
 
 # ── Core scan operation (runs PowerShell once) ──────────────────────
 
+_LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 NAPS2_PATHS = (
     r"C:\Program Files\NAPS2\NAPS2.Console.exe",
     r"C:\Program Files (x86)\NAPS2\NAPS2.Console.exe",
+    os.path.join(_LOCALAPPDATA, "HPScanner", "naps2-portable", "NAPS2.Console.exe"),
+    os.path.join(_LOCALAPPDATA, "HPScanner", "naps2-portable", "App", "NAPS2.Console.exe"),
 )
 
 
 def _find_naps2() -> str | None:
+    # Direct candidates first
     for p in NAPS2_PATHS:
-        if os.path.exists(p):
+        if p and os.path.exists(p):
             return p
+    # Some portable layouts nest the binary deeper — last-resort recursive search
+    portable_root = os.path.join(_LOCALAPPDATA, "HPScanner", "naps2-portable") if _LOCALAPPDATA else ""
+    if portable_root and os.path.isdir(portable_root):
+        for dirpath, _dirs, files in os.walk(portable_root):
+            if "NAPS2.Console.exe" in files:
+                return os.path.join(dirpath, "NAPS2.Console.exe")
     return None
 
 
