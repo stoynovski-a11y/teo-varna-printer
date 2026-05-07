@@ -236,49 +236,90 @@ def make_thumbnail(png_bytes: bytes) -> str:
 # ── Core scan operation (runs PowerShell once) ──────────────────────
 
 # Tracks the in-flight scan subprocess so /reset can kill it if the
-# scanner firmware locks up mid-Transfer (otherwise the user-facing
-# Reset button is useless precisely when they need it most).
+# scanner firmware locks up mid-Transfer.
 _running_scan_proc: subprocess.Popen | None = None
 
 
+def _kill_tree(pid: int) -> None:
+    """taskkill /T /F kills the process AND all descendants. Use this instead
+    of proc.kill() because PowerShell hangs in COM calls keep child handles
+    open, which deadlocks proc.communicate() draining pipes."""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, timeout=10, creationflags=NO_WINDOW,
+        )
+    except Exception as e:
+        log(f"_kill_tree | PID {pid} | failed: {e}")
+
+
 def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
-    """Run scan.ps1 once. Returns (ok, output_path, error_msg)."""
+    """Run scan.ps1 once. Returns (ok, output_path, error_msg).
+
+    Implementation note: stdout goes to a file instead of subprocess.PIPE,
+    because PIPE-based communicate() deadlocks if PowerShell's COM call
+    hangs (child processes keep pipe handles open even after kill())."""
     global _running_scan_proc
     timestamp = datetime.now().strftime("%H%M%S%f")
     tmp = os.path.join(tempfile.gettempdir(), f"hp_scan_{timestamp}.bmp")
+    out_file = os.path.join(tempfile.gettempdir(), f"hp_scan_{timestamp}.out")
     if os.path.exists(tmp):
         os.remove(tmp)
 
-    proc = subprocess.Popen(
-        [
-            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-File", str(SCAN_PS1),
-            "-DPI", str(dpi),
-            "-ColorIntent", str(intent),
-            "-OutputPath", tmp,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        creationflags=NO_WINDOW,
-    )
-    _running_scan_proc = proc
+    log(f"scan exec | spawning powershell (dpi={dpi}, intent={intent})")
+    out_handle = open(out_file, "w", encoding="utf-8", errors="replace")
     try:
+        proc = subprocess.Popen(
+            [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(SCAN_PS1),
+                "-DPI", str(dpi),
+                "-ColorIntent", str(intent),
+                "-OutputPath", tmp,
+            ],
+            stdout=out_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=NO_WINDOW,
+        )
+        _running_scan_proc = proc
         try:
-            stdout, _ = proc.communicate(timeout=90)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            return False, None, "timeout"
+            try:
+                proc.wait(timeout=90)
+                log(f"scan exec | powershell exited rc={proc.returncode}")
+            except subprocess.TimeoutExpired:
+                log(f"scan exec | TIMEOUT after 90s — killing PID {proc.pid} + tree")
+                _kill_tree(proc.pid)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                return False, None, "timeout"
+        finally:
+            _running_scan_proc = None
     finally:
-        _running_scan_proc = None
+        try:
+            out_handle.close()
+        except Exception:
+            pass
 
-    if proc.returncode == -9 or proc.returncode == 1 and not stdout:
-        return False, None, "killed by reset"
+    try:
+        with open(out_file, "r", encoding="utf-8", errors="replace") as f:
+            stdout = f.read()
+    except OSError:
+        stdout = ""
+    finally:
+        try:
+            os.remove(out_file)
+        except OSError:
+            pass
 
     output = (stdout or "").strip()
+    log(f"scan exec | output: {output[:120]!r}")
+
     if output.startswith("ERROR:"):
         return False, None, output[6:].strip()
+    if not output:
+        return False, None, "killed by reset"
     if output != "OK" or not os.path.exists(tmp):
         return False, None, f"unexpected output: {output[:200]}"
     return True, tmp, None
@@ -388,17 +429,13 @@ def reset():
     presses it because the scanner is hung."""
     log("manual /reset | requested")
 
-    # 1. If a scan is in flight, kill its PowerShell process. The /scan
-    # handler's finally block will release scan_lock once Popen returns.
+    # 1. If a scan is in flight, kill its whole PowerShell process tree.
+    # /scan handler's finally block will release scan_lock once Popen returns.
     proc = _running_scan_proc
     if proc is not None and proc.poll() is None:
-        log("manual /reset | killing in-flight scan process")
-        try:
-            proc.kill()
-        except Exception as e:
-            log(f"manual /reset | kill failed: {e}")
-        # Give /scan a moment to release the lock so the next scan can start.
-        time.sleep(0.5)
+        log(f"manual /reset | killing in-flight scan process tree PID {proc.pid}")
+        _kill_tree(proc.pid)
+        time.sleep(1)
 
     # 2. Restart WIA — does NOT need scan_lock; it's an OS-level operation.
     ok, msg = restart_wia(reason="manual /reset")
