@@ -184,31 +184,48 @@ def make_thumbnail(png_bytes: bytes) -> str:
 
 # ── Core scan operation (runs PowerShell once) ──────────────────────
 
+# Tracks the in-flight scan subprocess so /reset can kill it if the
+# scanner firmware locks up mid-Transfer (otherwise the user-facing
+# Reset button is useless precisely when they need it most).
+_running_scan_proc: subprocess.Popen | None = None
+
+
 def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
     """Run scan.ps1 once. Returns (ok, output_path, error_msg)."""
+    global _running_scan_proc
     timestamp = datetime.now().strftime("%H%M%S%f")
     tmp = os.path.join(tempfile.gettempdir(), f"hp_scan_{timestamp}.bmp")
     if os.path.exists(tmp):
         os.remove(tmp)
 
+    proc = subprocess.Popen(
+        [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(SCAN_PS1),
+            "-DPI", str(dpi),
+            "-ColorIntent", str(intent),
+            "-OutputPath", tmp,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=NO_WINDOW,
+    )
+    _running_scan_proc = proc
     try:
-        result = subprocess.run(
-            [
-                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-File", str(SCAN_PS1),
-                "-DPI", str(dpi),
-                "-ColorIntent", str(intent),
-                "-OutputPath", tmp,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,                    # was 180; shorter so we retry sooner
-            creationflags=NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired:
-        return False, None, "timeout"
+        try:
+            stdout, _ = proc.communicate(timeout=90)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return False, None, "timeout"
+    finally:
+        _running_scan_proc = None
 
-    output = (result.stdout or "").strip()
+    if proc.returncode == -9 or proc.returncode == 1 and not stdout:
+        return False, None, "killed by reset"
+
+    output = (stdout or "").strip()
     if output.startswith("ERROR:"):
         return False, None, output[6:].strip()
     if output != "OK" or not os.path.exists(tmp):
@@ -304,26 +321,37 @@ def scan():
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    """Manual recovery: restart the WIA service. Only one at a time."""
-    if not scan_lock.acquire(blocking=False):
-        return jsonify(ok=False, error="A scan is in progress. Wait for it to finish.")
-    try:
-        ok, msg = restart_wia(reason="manual /reset")
-        if ok:
-            return jsonify(ok=True, message=msg)
-        # If admin missing, surface that clearly so colleague knows what to do.
-        if "not running as admin" in msg.lower():
-            return jsonify(
-                ok=False,
-                error=(
-                    "Cannot restart scanner — the app is not running as administrator.\n\n"
-                    "Close this window, right-click 'СТАРТИРАЙ СКЕНЕР.bat', "
-                    "and choose 'Run as administrator'."
-                ),
-            )
-        return jsonify(ok=False, error=msg)
-    finally:
-        scan_lock.release()
+    """Manual recovery: kill any in-flight scan and restart the WIA service.
+    Bypasses the scan lock — the whole point of this button is that the user
+    presses it because the scanner is hung."""
+    log("manual /reset | requested")
+
+    # 1. If a scan is in flight, kill its PowerShell process. The /scan
+    # handler's finally block will release scan_lock once Popen returns.
+    proc = _running_scan_proc
+    if proc is not None and proc.poll() is None:
+        log("manual /reset | killing in-flight scan process")
+        try:
+            proc.kill()
+        except Exception as e:
+            log(f"manual /reset | kill failed: {e}")
+        # Give /scan a moment to release the lock so the next scan can start.
+        time.sleep(0.5)
+
+    # 2. Restart WIA — does NOT need scan_lock; it's an OS-level operation.
+    ok, msg = restart_wia(reason="manual /reset")
+    if ok:
+        return jsonify(ok=True, message=msg)
+    if "not running as admin" in msg.lower():
+        return jsonify(
+            ok=False,
+            error=(
+                "Cannot restart scanner — the app is not running as administrator.\n\n"
+                "Close this window, right-click 'СТАРТИРАЙ СКЕНЕР.bat', "
+                "and choose 'Run as administrator'."
+            ),
+        )
+    return jsonify(ok=False, error=msg)
 
 
 @app.route("/pages", methods=["GET"])
