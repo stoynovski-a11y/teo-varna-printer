@@ -279,62 +279,103 @@ def _kill_tree(pid: int) -> None:
 _NAPS2_BITDEPTH = {1: "color", 2: "gray", 4: "bw"}
 
 
-def _run_scan_naps2(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
-    """Scan via NAPS2.Console + TWAIN driver. Bypasses the broken WIA path.
-    Returns (ok, output_path_PNG, error). Returns (False, None, 'naps2_unavailable')
-    immediately if NAPS2 isn't installed — caller falls back to WIA path."""
+def _naps2_call(naps2: str, args: list[str], timeout: int = 60) -> tuple[int, str]:
+    """Run NAPS2.Console with stdout+stderr merged. Returns (rc, output)."""
     global _running_scan_proc
-    naps2 = _find_naps2()
-    if not naps2:
-        return False, None, "naps2_unavailable"
-
-    timestamp = datetime.now().strftime("%H%M%S%f")
-    out_png = os.path.join(tempfile.gettempdir(), f"hp_scan_naps2_{timestamp}.png")
-
-    # Try TWAIN first (HP M1132's WIA stack hangs; TWAIN works).
-    cmd = [
-        naps2,
-        "-o", out_png,
-        "--noprofile",
-        "--driver", "twain",
-        "--device", "M1132",
-        "--dpi", str(dpi),
-        "--bitdepth", _NAPS2_BITDEPTH.get(intent, "gray"),
-        "-n", "1",
-        "--source", "glass",
-        "--force",                # overwrite output
-    ]
-    log(f"naps2 exec | dpi={dpi} bitdepth={_NAPS2_BITDEPTH.get(intent)}")
-
     proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        [naps2] + args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         creationflags=NO_WINDOW,
     )
     _running_scan_proc = proc
     try:
         try:
-            _, stderr = proc.communicate(timeout=60)
+            out, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            log(f"naps2 exec | TIMEOUT after 60s — killing PID {proc.pid} + tree")
+            log(f"naps2 exec | TIMEOUT after {timeout}s — killing PID {proc.pid}")
             _kill_tree(proc.pid)
             try:
-                proc.communicate(timeout=5)
+                out, _ = proc.communicate(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
-            return False, None, "timeout"
+                out = ""
+            return -1, out or ""
+        return proc.returncode, out or ""
     finally:
         _running_scan_proc = None
 
-    if os.path.exists(out_png) and os.path.getsize(out_png) > 0:
-        log(f"naps2 exec | OK ({os.path.getsize(out_png)} bytes)")
-        return True, out_png, None
 
-    err = (stderr or "").strip() or f"naps2 rc={proc.returncode}"
-    log(f"naps2 exec | FAILED: {err[:200]}")
-    return False, None, err[:200]
+def _naps2_list_devices(naps2: str, driver: str) -> str:
+    """Diagnostic: ask NAPS2 what devices it sees on the given driver."""
+    rc, out = _naps2_call(naps2, ["--listdevices", "--driver", driver, "--noprofile"], timeout=20)
+    return out.strip()
+
+
+def _run_scan_naps2(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
+    """Scan via NAPS2.Console. Try TWAIN first (M1132 WIA path hangs in
+    Transfer); fall back to NAPS2's WIA implementation if TWAIN unavailable.
+    Returns (ok, output_path_PNG, error). Returns (False, None, 'naps2_unavailable')
+    immediately if NAPS2 isn't installed."""
+    naps2 = _find_naps2()
+    if not naps2:
+        return False, None, "naps2_unavailable"
+
+    timestamp = datetime.now().strftime("%H%M%S%f")
+    out_png = os.path.join(tempfile.gettempdir(), f"hp_scan_naps2_{timestamp}.png")
+    bitdepth = _NAPS2_BITDEPTH.get(intent, "gray")
+
+    # Try driver/device combinations in order. Each line: (driver, device-or-None).
+    # Empty device = let NAPS2 pick the first available scanner.
+    attempts = [
+        ("twain", None),       # most reliable on M1132 — auto-pick TWAIN device
+        ("twain", "M1132"),    # explicit name match if multiple devices present
+        ("twain", "LaserJet"), # broader match (HP TWAIN may register as 'HP LaserJet ...')
+        ("wia",   None),       # NAPS2's WIA — different code path than scan.ps1
+    ]
+
+    last_err = "no attempts ran"
+    for driver, device in attempts:
+        # Wipe any partial output from previous attempt
+        try:
+            if os.path.exists(out_png):
+                os.remove(out_png)
+        except OSError:
+            pass
+
+        args = [
+            "-o", out_png,
+            "--noprofile",
+            "--driver", driver,
+            "--dpi", str(dpi),
+            "--bitdepth", bitdepth,
+            "-n", "1",
+            "--force",
+        ]
+        if device:
+            args += ["--device", device]
+
+        label = f"{driver}" + (f"/{device}" if device else "/auto")
+        log(f"naps2 exec | trying {label} (dpi={dpi}, bitdepth={bitdepth})")
+
+        rc, out = _naps2_call(naps2, args, timeout=60)
+        out_short = out.strip().replace("\r", " ").replace("\n", " | ")[:300]
+
+        if os.path.exists(out_png) and os.path.getsize(out_png) > 0:
+            log(f"naps2 exec | {label} OK ({os.path.getsize(out_png)} bytes)")
+            return True, out_png, None
+
+        last_err = f"{label} rc={rc} | {out_short}" if out_short else f"{label} rc={rc}"
+        log(f"naps2 exec | {label} FAILED: {last_err[:300]}")
+
+    # All attempts failed. Run a final diagnostic to log what NAPS2 actually sees.
+    log("naps2 exec | all attempts failed — listing visible devices for diagnosis")
+    twain_devs = _naps2_list_devices(naps2, "twain")
+    wia_devs = _naps2_list_devices(naps2, "wia")
+    log(f"naps2 exec | TWAIN devices: {twain_devs[:200]!r}")
+    log(f"naps2 exec | WIA devices:   {wia_devs[:200]!r}")
+
+    return False, None, last_err[:200]
 
 
 def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
