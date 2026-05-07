@@ -21,14 +21,11 @@ echo.
 
 cd /d "%~dp0"
 
-REM ---- Install NAPS2 on first launch (TWAIN backend bypasses M1132 WIA bug) ----
-REM Logic lives in install_naps2.ps1 (avoids cmd-to-powershell quote escape hell).
-REM Idempotent: the .ps1 exits immediately if NAPS2 is already installed.
-if not exist "C:\Program Files\NAPS2\NAPS2.Console.exe" (
-    if not exist "C:\Program Files (x86)\NAPS2\NAPS2.Console.exe" (
-        powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_naps2.ps1"
-    )
-)
+REM ---- Provision NAPS2 on first launch (TWAIN backend bypasses M1132 WIA bug) ----
+REM Logic lives in install_naps2.ps1 — uses portable ZIP extraction, not silent
+REM installer (avoids SmartScreen/AV blocks). The .ps1 exits 0 immediately if
+REM NAPS2 is already available, so this is safe to call every launch.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_naps2.ps1"
 
 REM ---- Disable USB Selective Suspend on the active power plan ----
 REM Sleeping the USB endpoint is the #1 trigger of the M1132 firmware
