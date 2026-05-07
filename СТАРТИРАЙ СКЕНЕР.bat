@@ -21,6 +21,21 @@ echo.
 
 cd /d "%~dp0"
 
+REM ---- Install NAPS2 on first launch (TWAIN backend bypasses M1132 WIA bug) ----
+if not exist "C:\Program Files\NAPS2\NAPS2.Console.exe" (
+    if not exist "C:\Program Files (x86)\NAPS2\NAPS2.Console.exe" (
+        echo [..] First launch: installing NAPS2 scanner backend ^(one-time, ~30s^)...
+        powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { $r = Invoke-RestMethod 'https://api.github.com/repos/cyanfish/naps2/releases/latest'; $a = $r.assets | Where-Object { $_.name -like '*setup.exe' -and $_.name -notlike '*portable*' } | Select-Object -First 1; Invoke-WebRequest $a.browser_download_url -OutFile \"$env:TEMP\naps2-setup.exe\" } catch { exit 1 }"
+        if exist "%TEMP%\naps2-setup.exe" (
+            start /wait "" "%TEMP%\naps2-setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+            del "%TEMP%\naps2-setup.exe" 2>nul
+            echo [OK] NAPS2 installed.
+        ) else (
+            echo [!] NAPS2 download failed - will fall back to WIA scanning.
+        )
+    )
+)
+
 REM ---- Disable USB Selective Suspend on the active power plan ----
 REM Sleeping the USB endpoint is the #1 trigger of the M1132 firmware
 REM lockup. Idempotent — safe to run every launch.

@@ -235,6 +235,19 @@ def make_thumbnail(png_bytes: bytes) -> str:
 
 # ── Core scan operation (runs PowerShell once) ──────────────────────
 
+NAPS2_PATHS = (
+    r"C:\Program Files\NAPS2\NAPS2.Console.exe",
+    r"C:\Program Files (x86)\NAPS2\NAPS2.Console.exe",
+)
+
+
+def _find_naps2() -> str | None:
+    for p in NAPS2_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 # Tracks the in-flight scan subprocess so /reset can kill it if the
 # scanner firmware locks up mid-Transfer.
 _running_scan_proc: subprocess.Popen | None = None
@@ -251,6 +264,67 @@ def _kill_tree(pid: int) -> None:
         )
     except Exception as e:
         log(f"_kill_tree | PID {pid} | failed: {e}")
+
+
+_NAPS2_BITDEPTH = {1: "color", 2: "gray", 4: "bw"}
+
+
+def _run_scan_naps2(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
+    """Scan via NAPS2.Console + TWAIN driver. Bypasses the broken WIA path.
+    Returns (ok, output_path_PNG, error). Returns (False, None, 'naps2_unavailable')
+    immediately if NAPS2 isn't installed — caller falls back to WIA path."""
+    global _running_scan_proc
+    naps2 = _find_naps2()
+    if not naps2:
+        return False, None, "naps2_unavailable"
+
+    timestamp = datetime.now().strftime("%H%M%S%f")
+    out_png = os.path.join(tempfile.gettempdir(), f"hp_scan_naps2_{timestamp}.png")
+
+    # Try TWAIN first (HP M1132's WIA stack hangs; TWAIN works).
+    cmd = [
+        naps2,
+        "-o", out_png,
+        "--noprofile",
+        "--driver", "twain",
+        "--device", "M1132",
+        "--dpi", str(dpi),
+        "--bitdepth", _NAPS2_BITDEPTH.get(intent, "gray"),
+        "-n", "1",
+        "--source", "glass",
+        "--force",                # overwrite output
+    ]
+    log(f"naps2 exec | dpi={dpi} bitdepth={_NAPS2_BITDEPTH.get(intent)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=NO_WINDOW,
+    )
+    _running_scan_proc = proc
+    try:
+        try:
+            _, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            log(f"naps2 exec | TIMEOUT after 60s — killing PID {proc.pid} + tree")
+            _kill_tree(proc.pid)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return False, None, "timeout"
+    finally:
+        _running_scan_proc = None
+
+    if os.path.exists(out_png) and os.path.getsize(out_png) > 0:
+        log(f"naps2 exec | OK ({os.path.getsize(out_png)} bytes)")
+        return True, out_png, None
+
+    err = (stderr or "").strip() or f"naps2 rc={proc.returncode}"
+    log(f"naps2 exec | FAILED: {err[:200]}")
+    return False, None, err[:200]
 
 
 def _run_scan_once(dpi: int, intent: int) -> tuple[bool, str | None, str | None]:
@@ -404,15 +478,29 @@ def scan():
         n = scan_counter
         log(f"scan {n} | start | dpi={dpi} color={color}")
 
+        # Primary path: NAPS2 + TWAIN. The M1132's WIA driver path hangs in
+        # Transfer() — TWAIN goes through a different driver entry point
+        # inside the printer firmware and does not exhibit the bug.
         t0 = time.time()
-        ok, tmp, err = _run_scan_once(dpi, intent)
+        ok, tmp, err = _run_scan_naps2(dpi, intent)
         dt = time.time() - t0
 
-        # Auto-recovery ladder for the M1132 firmware lockup:
-        #   tier 1: WIA service restart + retry
-        #   tier 2: device re-enumeration (Disable/Enable PnP) + retry
+        # Fall back to WIA-via-PowerShell if NAPS2 isn't installed yet, or
+        # fails for a non-driver reason (e.g. user didn't install HP TWAIN).
+        if not ok and err == "naps2_unavailable":
+            log(f"scan {n} | NAPS2 not installed — falling back to WIA")
+            t0 = time.time()
+            ok, tmp, err = _run_scan_once(dpi, intent)
+            dt = time.time() - t0
+        elif not ok:
+            log(f"scan {n} | NAPS2 failed ({dt:.1f}s): {err} — falling back to WIA")
+            t0 = time.time()
+            ok, tmp, err = _run_scan_once(dpi, intent)
+            dt = time.time() - t0
+
+        # Recovery ladder kicks in only for WIA path failures.
         if not ok and _is_recoverable(err or ""):
-            log(f"scan {n} | FAILED ({dt:.1f}s): {err} — tier 1 recovery (WIA)")
+            log(f"scan {n} | WIA FAILED ({dt:.1f}s): {err} — tier 1 recovery")
             restart_wia(reason=f"scan {n} failure")
 
             t0 = time.time()
